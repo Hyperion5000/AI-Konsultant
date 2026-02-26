@@ -5,6 +5,11 @@ from langchain_core.tools import BaseTool
 from langgraph.prebuilt import ToolNode as CoreToolNode
 
 from bot.graph.state import AgentState
+from bot.core.prompts import (
+    MSG_TOOL_ERROR_PREFIX,
+    MSG_TOOL_ERROR_SUFFIX,
+    MSG_TOOL_CRITICAL_ERROR
+)
 
 async def call_model(state: AgentState, config: RunnableConfig, llm: Runnable):
     """
@@ -49,8 +54,8 @@ def create_tool_node(tools: List[BaseTool]):
                             # "Ошибка вызова функции. Проверь аргументы и верни корректный JSON."
                             # We can append the original error to be helpful.
                             new_content = (
-                                f"Ошибка вызова функции: {msg.content}. "
-                                "Проверь аргументы и верни корректный JSON."
+                                f"{MSG_TOOL_ERROR_PREFIX}{msg.content}"
+                                f"{MSG_TOOL_ERROR_SUFFIX}"
                             )
                             new_msg = ToolMessage(
                                 content=new_content,
@@ -74,8 +79,8 @@ def create_tool_node(tools: List[BaseTool]):
                 return {
                     "messages": [
                         ToolMessage(
-                            content=f"Ошибка вызова функции (Critical): {str(e)}. "
-                                    f"Проверь аргументы и верни корректный JSON.",
+                            content=f"{MSG_TOOL_CRITICAL_ERROR}{str(e)}"
+                                    f"{MSG_TOOL_ERROR_SUFFIX}",
                             tool_call_id=tool_call["id"],
                             status="error"
                         )

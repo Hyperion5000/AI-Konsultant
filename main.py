@@ -2,13 +2,14 @@ import asyncio
 import logging
 from aiogram import Bot, Dispatcher
 from bot import config
-from bot.rag_service import RAGService
+from bot.core.resources import initialize_bot_resources
 from bot.handlers import base, chat
 from bot import database
+from bot.core.logger import configure_logging, get_logger
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+configure_logging()
+logger = get_logger(__name__)
 
 async def main():
     # Initialize Analytics DB
@@ -16,8 +17,6 @@ async def main():
         await database.init_db()
     except Exception as e:
         logger.error(f"Failed to initialize analytics DB: {e}")
-        # Continue anyway, bot can work without logs if needed, or exit.
-        # But MVP might prefer working bot.
 
     # Initialize Bot
     try:
@@ -26,18 +25,21 @@ async def main():
         logger.error(f"Invalid BOT_TOKEN: {e}")
         exit(1)
 
-    # Initialize RAG Service
+    # Initialize Resources (Graph, Retrievers, LLM)
+    graph = None
     try:
-        rag_service = RAGService()
+        graph = initialize_bot_resources()
     except Exception as e:
-        logger.error(f"Failed to initialize RAG Service: {e}")
-        rag_service = None
+        logger.error(f"Failed to initialize bot resources: {e}")
+        # We continue, but the bot won't be able to answer questions.
+        # Handlers check if graph is None.
 
     # Global lock for LLM
     llm_lock = asyncio.Lock()
 
     # Initialize Dispatcher with dependencies
-    dp = Dispatcher(rag_service=rag_service, llm_lock=llm_lock)
+    # Inject graph and llm_lock
+    dp = Dispatcher(graph=graph, llm_lock=llm_lock)
 
     # Include routers
     dp.include_router(base.router)

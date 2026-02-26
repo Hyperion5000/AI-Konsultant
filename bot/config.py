@@ -2,12 +2,12 @@ import os
 import logging
 from typing import Optional
 from dotenv import load_dotenv
+from bot.core.logger import get_logger
 
 load_dotenv()
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 def get_env_variable(name: str, default: Optional[str] = None, required: bool = False) -> Optional[str]:
     value = os.getenv(name, default)
@@ -36,6 +36,10 @@ def get_float_env(name: str, default: Optional[float] = None) -> Optional[float]
         logger.warning(f"Invalid float for {name}: {value}. Using default: {default}")
         return default
 
+# Project Paths
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+STORAGE_DIR = os.path.join(BASE_DIR, "storage")
+
 # Bot Configuration
 BOT_TOKEN: str = get_env_variable("BOT_TOKEN", required=True)
 
@@ -43,7 +47,10 @@ BOT_TOKEN: str = get_env_variable("BOT_TOKEN", required=True)
 EMBEDDING_MODEL: str = get_env_variable("EMBEDDING_MODEL", "cointegrated/rubert-tiny2")
 OLLAMA_BASE_URL: str = get_env_variable("OLLAMA_BASE_URL", "http://localhost:11434")
 OLLAMA_MODEL: str = get_env_variable("OLLAMA_MODEL", "qwen2.5:7b")
-CHROMA_DIR: str = get_env_variable("CHROMA_DIR", "db")
+
+CHROMA_DIR: str = get_env_variable("CHROMA_DIR", os.path.join(STORAGE_DIR, "chroma"))
+BM25_DIR: str = os.path.join(STORAGE_DIR, "bm25")
+SQLITE_DB_PATH: str = os.path.join(STORAGE_DIR, "sqlite", "analytics.db")
 
 # Increase default retrieval count for reranker
 RETRIEVER_K: int = get_int_env("RETRIEVER_K", 10)
