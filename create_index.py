@@ -53,6 +53,21 @@ def load_docx_files(data_dir: str) -> List[Document]:
 
     return documents
 
+def get_text_splitter() -> RecursiveCharacterTextSplitter:
+    """
+    Returns a configured text splitter for legal documents.
+    """
+    # Smart chunking for legal texts
+    # separators order matters: try to split by article/chapter first, then paragraphs, then sentences
+    separators = ["\nСтатья ", "\nГлава ", "\n\n", "\n", " ", ""]
+
+    return RecursiveCharacterTextSplitter(
+        chunk_size=CHUNK_SIZE,
+        chunk_overlap=CHUNK_OVERLAP,
+        separators=separators,
+        is_separator_regex=False
+    )
+
 def create_vector_store(documents: List[Document]):
     """
     Splits documents and creates a Chroma vector store.
@@ -61,16 +76,7 @@ def create_vector_store(documents: List[Document]):
         print("No documents to index.")
         return
 
-    # Smart chunking for legal texts
-    # separators order matters: try to split by article/chapter first, then paragraphs, then sentences
-    separators = ["\nСтатья ", "\nГлава ", "\n\n", "\n", " ", ""]
-
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=CHUNK_SIZE,
-        chunk_overlap=CHUNK_OVERLAP,
-        separators=separators,
-        is_separator_regex=False
-    )
+    text_splitter = get_text_splitter()
 
     split_docs = text_splitter.split_documents(documents)
     print(f"Split into {len(split_docs)} chunks.")

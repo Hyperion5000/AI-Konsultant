@@ -57,12 +57,12 @@ async def handle_message(message: types.Message):
         await message.answer("⏳ Система сейчас обрабатывает другой запрос, ваш вопрос в очереди...")
         # Wait for lock
         async with llm_lock:
-            await process_question(message, user_id, question)
+            await process_question(rag_service, message, user_id, question)
     else:
         async with llm_lock:
-            await process_question(message, user_id, question)
+            await process_question(rag_service, message, user_id, question)
 
-async def process_question(message: types.Message, user_id: int, question: str):
+async def process_question(rag_service: RAGService, message: types.Message, user_id: int, question: str):
     """
     Process the question using RAG service with streaming response.
     """
