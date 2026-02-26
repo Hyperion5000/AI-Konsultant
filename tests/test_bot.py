@@ -1,94 +1,151 @@
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
-from aiogram import types
 import asyncio
+from unittest.mock import MagicMock, AsyncMock, patch
+import main
+from main import process_question, handle_message, llm_lock, command_start_handler
 
-# Mock main.py dependencies before importing
-with patch("main.RAGService") as MockRAG:
-    from main import handle_message, process_question, llm_lock
+# --- Fixtures ---
 
 @pytest.fixture
 def mock_message():
-    message = AsyncMock(spec=types.Message)
-    message.text = "Hello Law"
-    message.from_user = MagicMock()
-    message.from_user.id = 123
-    message.from_user.full_name = "User"
+    # Use MagicMock for the message object itself, but ensure methods are AsyncMock
+    message = MagicMock()
+    message.from_user.id = 12345
+    message.from_user.full_name = "Test User"
+    message.text = "Test question"
+
+    # message.answer is an async method
     message.answer = AsyncMock()
+
+    # The result of awaiting message.answer(...) is status_msg
+    status_msg = MagicMock()
+    status_msg.edit_text = AsyncMock()
+
+    message.answer.return_value = status_msg
+
     return message
 
 @pytest.fixture
 def mock_rag_service():
-    rag = MagicMock()
-    # Mock get_answer to return async generator
-    async def mock_get_answer(user_id, question):
-        yield "Part 1"
-        yield "Part 2"
-    rag.get_answer = mock_get_answer
-    return rag
+    service = MagicMock()
+    return service
+
+# --- Tests ---
 
 @pytest.mark.asyncio
-async def test_handle_message_lock(mock_message, mock_rag_service):
-    # Patch main.rag_service
-    with patch("main.rag_service", mock_rag_service):
+async def test_command_start(mock_message):
+    """
+    Test /start command.
+    """
+    await command_start_handler(mock_message)
+    mock_message.answer.assert_called_once()
+    assert "Привет" in mock_message.answer.call_args[0][0]
+
+@pytest.mark.asyncio
+async def test_handle_message_unlocked(mock_message):
+    """
+    Test handle_message when lock is free.
+    """
+    # Ensure lock is free
+    if llm_lock.locked():
+        llm_lock.release()
+
+    with patch("main.process_question", new_callable=AsyncMock) as mock_process:
+        await handle_message(mock_message)
+
+        # Check that process_question was called directly
+        mock_process.assert_called_once()
+        # Check that "queue" message was NOT sent
+        mock_message.answer.assert_not_called()
+
+@pytest.mark.asyncio
+async def test_concurrency_lock_message(mock_message):
+    """
+    Test that if llm_lock is locked, the user receives a queue message.
+    """
+    await llm_lock.acquire()
+
+    try:
         with patch("main.process_question", new_callable=AsyncMock) as mock_process:
-            # Case 1: Lock is free
-            assert not llm_lock.locked()
-            await handle_message(mock_message)
-            mock_process.assert_awaited_once()
+            task = asyncio.create_task(handle_message(mock_message))
+            await asyncio.sleep(0.01)
 
-            # Case 2: Lock is taken
-            with patch("main.llm_lock") as mock_lock:
-                mock_lock.locked.return_value = True
-                mock_lock.__aenter__ = AsyncMock()
-                mock_lock.__aexit__ = AsyncMock()
+            mock_message.answer.assert_any_call("⏳ Система сейчас обрабатывает другой запрос, ваш вопрос в очереди...")
+            mock_process.assert_not_called()
 
-                await handle_message(mock_message)
+            llm_lock.release()
+            await task
+            mock_process.assert_called_once()
 
-                # Verify user was notified
-                mock_message.answer.assert_called_with("⏳ Система сейчас обрабатывает другой запрос, ваш вопрос в очереди...")
+    finally:
+        if llm_lock.locked():
+            llm_lock.release()
 
 @pytest.mark.asyncio
-async def test_process_question_streaming(mock_message, mock_rag_service):
-    with patch("main.rag_service", mock_rag_service):
-        with patch("main.time.time") as mock_time:
-            # Create a generator for time
-            time_values = [0, 0.1, 2.0, 4.0, 6.0, 8.0, 10.0]
-            mock_time.side_effect = time_values
+async def test_debounce_buffer_logic(mock_rag_service, mock_message):
+    """
+    Critical Test: Verify edit_text is called only when buffer conditions are met.
+    """
+    async def fast_chunk_generator(user_id, question):
+        for i in range(100):
+            yield "a"
 
-            # Mock status message returned by answer
-            status_msg = AsyncMock()
-            mock_message.answer.return_value = status_msg
+    mock_rag_service.get_answer.side_effect = fast_chunk_generator
 
-            # Use large chunks to trigger update
-            async def large_chunks(user_id, question):
-                yield "A" * 20 # Buffer 20
-                yield "B" * 20 # Buffer 40. Total 40.
+    time_values = [1000.0] # init
+    time_values.extend([1000.0] * 50) # loop 0-49 (chunks 1-50)
+    time_values.append(1002.0) # loop 50 (chunk 51) -> Update
 
-            mock_rag_service.get_answer = large_chunks
+    remaining_calls = 100 - 50 - 1
+    time_values.extend([1002.0] * remaining_calls)
+    time_values.extend([1005.0] * 10)
 
-            await process_question(mock_message, 123, "Question")
+    with patch("time.time", side_effect=time_values):
+        await process_question(mock_rag_service, mock_message, 123, "Test")
 
-            # Verify answer called
-            mock_message.answer.assert_called_with("🔍 Анализирую законы...")
+    status_msg = mock_message.answer.return_value
 
-            # Verify edits
-            # 1. Start: time=0
-            # 2. Chunk A: time=0.1. Diff=0.1. No edit.
-            # 3. Chunk B: time=2.0. Diff=1.9. Buffer=40 > 30. Edit!
-            #    Edit with "A"*20 + "B"*20 + " ▌"
-            #    Reset buffer to ""? No, process_question resets buffer.
-            # 4. Final update with "A"*20 + "B"*20
+    # Verify debounce
+    # We expect at least one update (chunk 51) and one final update (chunk 100)
+    assert status_msg.edit_text.call_count >= 2
+    assert status_msg.edit_text.call_count < 10
 
-            # Check calls
-            # We expect at least one intermediate edit and one final edit.
-            assert status_msg.edit_text.call_count >= 2
+    # Check intermediate update has cursor
+    calls = status_msg.edit_text.call_args_list
+    assert "▌" in calls[0][0][0]
 
-            # Check arguments of intermediate edit
-            # The exact content might vary depending on loop, but we expect cursor in intermediate
-            intermediate_call = status_msg.edit_text.call_args_list[-2]
-            assert "▌" in intermediate_call[0][0]
+    # Check final update has no cursor and full text
+    assert calls[-1][0][0] == "a" * 100
 
-            final_call = status_msg.edit_text.call_args_list[-1]
-            assert "▌" not in final_call[0][0]
-            assert final_call[0][0] == "A"*20 + "B"*20
+@pytest.mark.asyncio
+async def test_graceful_degradation_error(mock_rag_service, mock_message):
+    """
+    Test that exceptions in RAG service are handled gracefully.
+    """
+    async def error_generator(user_id, question):
+        yield "Start"
+        raise Exception("Database Connection Failed")
+
+    mock_rag_service.get_answer.side_effect = error_generator
+
+    await process_question(mock_rag_service, mock_message, 123, "Error test")
+
+    status_msg = mock_message.answer.return_value
+    assert status_msg.edit_text.called
+    assert "Произошла ошибка при генерации ответа" in status_msg.edit_text.call_args_list[-1][0][0]
+
+@pytest.mark.asyncio
+async def test_empty_response(mock_rag_service, mock_message):
+    """
+    Test handling of empty response from RAG service.
+    """
+    async def empty_generator(user_id, question):
+        if False: yield "nothing" # Empty generator
+
+    mock_rag_service.get_answer.side_effect = empty_generator
+
+    await process_question(mock_rag_service, mock_message, 123, "Test")
+
+    status_msg = mock_message.answer.return_value
+    status_msg.edit_text.assert_called_with("К сожалению, я не смог сформировать ответ.")
+
