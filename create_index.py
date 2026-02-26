@@ -2,11 +2,13 @@ import os
 import glob
 import argparse
 import logging
+import pickle
 from typing import List, Optional
 from dotenv import load_dotenv
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
+from langchain_community.retrievers import BM25Retriever
 from langchain_core.documents import Document
 import docx
 
@@ -28,7 +30,7 @@ logger = logging.getLogger(__name__)
 
 def load_documents(data_dir: str) -> List[Document]:
     """
-    Scans the data directory for .docx, .txt, and .md files and loads their content.
+    Scans the data directory for .docx, .txt, .md, and .pdf files and loads their content.
     """
     documents = []
 
@@ -66,6 +68,24 @@ def load_documents(data_dir: str) -> List[Document]:
             except Exception as e:
                 logger.error(f"Error loading {file_path}: {e}")
 
+    # 3. Load .pdf files
+    pdf_files = glob.glob(os.path.join(data_dir, "**", "*.pdf"), recursive=True)
+    if pdf_files:
+        logger.info(f"Found {len(pdf_files)} .pdf files.")
+        for file_path in pdf_files:
+            try:
+                import fitz  # pymupdf
+                doc = fitz.open(file_path)
+                full_text = []
+                for page in doc:
+                    full_text.append(page.get_text())
+                text = "\n".join(full_text)
+                if text.strip():
+                    filename = os.path.basename(file_path)
+                    documents.append(Document(page_content=text, metadata={"source": filename, "type": "pdf"}))
+            except Exception as e:
+                logger.error(f"Error loading {file_path}: {e}")
+
     logger.info(f"Total documents loaded: {len(documents)}")
     return documents
 
@@ -92,7 +112,7 @@ def create_vector_store(
     chunk_overlap: int
 ):
     """
-    Splits documents, adds metadata, and creates a Chroma vector store.
+    Splits documents, adds metadata, and creates a Chroma vector store + BM25 index.
     """
     if not documents:
         logger.warning("No documents to index.")
@@ -113,7 +133,22 @@ def create_vector_store(
 
     logger.info(f"Split into {len(split_docs)} chunks.")
 
-    # Initialize Embeddings
+    # 1. Create and save BM25 Retriever
+    logger.info("Creating BM25 retriever...")
+    try:
+        bm25_retriever = BM25Retriever.from_documents(split_docs)
+        # We save the retriever using pickle
+        if not os.path.exists(persist_dir):
+            os.makedirs(persist_dir)
+
+        bm25_path = os.path.join(persist_dir, "bm25_retriever.pkl")
+        with open(bm25_path, "wb") as f:
+            pickle.dump(bm25_retriever, f)
+        logger.info(f"BM25 retriever saved to {bm25_path}")
+    except Exception as e:
+        logger.error(f"Failed to create BM25 retriever: {e}")
+
+    # 2. Create Chroma DB
     logger.info(f"Initializing embeddings model: {embedding_model_name}...")
     try:
         embeddings = HuggingFaceEmbeddings(model_name=embedding_model_name)
@@ -121,11 +156,11 @@ def create_vector_store(
         logger.error(f"Failed to initialize embeddings: {e}")
         return
 
-    # Create Chroma DB
     logger.info(f"Creating Chroma vector store in {persist_dir}...")
     try:
-        if os.path.exists(persist_dir):
-            logger.warning(f"Directory {persist_dir} already exists. Appending to existing DB (or overwriting depending on Chroma version).")
+        if os.path.exists(persist_dir) and os.path.exists(os.path.join(persist_dir, "chroma.sqlite3")):
+             # Check if we should append or warn. Chroma default is append.
+             logger.warning(f"Chroma DB already exists in {persist_dir}. Appending.")
 
         vector_store = Chroma.from_documents(
             documents=split_docs,

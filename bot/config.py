@@ -44,9 +44,16 @@ EMBEDDING_MODEL: str = get_env_variable("EMBEDDING_MODEL", "cointegrated/rubert-
 OLLAMA_BASE_URL: str = get_env_variable("OLLAMA_BASE_URL", "http://localhost:11434")
 OLLAMA_MODEL: str = get_env_variable("OLLAMA_MODEL", "qwen2.5:7b")
 CHROMA_DIR: str = get_env_variable("CHROMA_DIR", "db")
-RETRIEVER_K: int = get_int_env("RETRIEVER_K", 4)
+
+# Increase default retrieval count for reranker
+RETRIEVER_K: int = get_int_env("RETRIEVER_K", 10)
+
 TEMPERATURE: float = get_float_env("TEMPERATURE", 0.3)
 MAX_DISTANCE: Optional[float] = get_float_env("MAX_DISTANCE", None) # None implies disabled
+
+# Reranker Configuration
+RERANKER_MODEL: str = get_env_variable("RERANKER_MODEL", "cross-encoder/mmarco-mMiniLM-v2-L12-H384-v1")
+RERANKER_K: int = get_int_env("RERANKER_K", 3)
 
 # Concurrency
 LLM_CONCURRENCY: int = get_int_env("LLM_CONCURRENCY", 1)
