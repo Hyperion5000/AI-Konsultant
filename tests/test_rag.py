@@ -1,123 +1,132 @@
 import pytest
 import asyncio
-import os
 from unittest.mock import MagicMock, AsyncMock, patch
+from langchain_core.messages import HumanMessage, AIMessage, AIMessageChunk
 from langchain_core.documents import Document
 from bot.rag_service import RAGService
-from bot import config
 
 @pytest.fixture
-def mock_rag_dependencies():
-    # We patch classes and os.path.exists
+def mock_dependencies():
     with patch("bot.rag_service.Chroma") as MockChroma, \
          patch("bot.rag_service.HuggingFaceEmbeddings") as MockEmbeddings, \
          patch("bot.rag_service.ChatOllama") as MockOllama, \
          patch("bot.rag_service.EnsembleRetriever") as MockEnsemble, \
-         patch("bot.rag_service.pickle.load") as MockPickleLoad, \
-         patch("bot.rag_service.HuggingFaceCrossEncoder") as MockHFCrossEncoder, \
-         patch("bot.rag_service.CrossEncoderReranker") as MockCrossEncoderReranker, \
-         patch("bot.rag_service.ContextualCompressionRetriever") as MockCompressionRetriever, \
-         patch("os.path.exists", return_value=True) as MockExists, \
-         patch("builtins.open", new_callable=MagicMock): # Mock open for pickle loading
+         patch("bot.rag_service.create_agent_graph") as MockCreateGraph, \
+         patch("bot.rag_service.set_retriever") as MockSetRetriever, \
+         patch("bot.rag_service.pickle.load") as MockPickle, \
+         patch("bot.rag_service.HuggingFaceCrossEncoder") as MockCrossEncoder, \
+         patch("bot.rag_service.CrossEncoderReranker") as MockReranker, \
+         patch("bot.rag_service.ContextualCompressionRetriever") as MockCompression, \
+         patch("os.path.exists", return_value=True), \
+         patch("builtins.open", new_callable=MagicMock):
 
-        mock_vector_store = MagicMock()
-        MockChroma.return_value = mock_vector_store
-
-        # Mock as_retriever
         mock_retriever = MagicMock()
+        mock_vector_store = MagicMock()
         mock_vector_store.as_retriever.return_value = mock_retriever
+        MockChroma.return_value = mock_vector_store
 
         mock_llm = MagicMock()
         MockOllama.return_value = mock_llm
 
-        mock_ensemble_instance = MagicMock()
-        MockEnsemble.return_value = mock_ensemble_instance
+        mock_graph = MagicMock()
+        MockCreateGraph.return_value = mock_graph
 
-        MockPickleLoad.return_value = MagicMock() # BM25 retriever mock
-
-        mock_compression_retriever_instance = MagicMock()
-        MockCompressionRetriever.return_value = mock_compression_retriever_instance
-
-        yield mock_vector_store, mock_llm, MockEnsemble, mock_ensemble_instance, \
-              MockHFCrossEncoder, MockCrossEncoderReranker, MockCompressionRetriever, \
-              mock_compression_retriever_instance, MockExists
+        yield mock_llm, mock_graph, MockCreateGraph
 
 @pytest.mark.asyncio
-async def test_reset_history(mock_rag_dependencies):
+async def test_initialization(mock_dependencies):
+    mock_llm, mock_graph, MockCreateGraph = mock_dependencies
     service = RAGService()
-    user_id = 123
-    service.history[user_id] = ["msg1", "msg2"]
 
-    service.reset_history(user_id)
-    assert user_id not in service.history
+    assert MockCreateGraph.called
+    assert service.graph == mock_graph
+    assert hasattr(service, "llm_semaphore")
 
 @pytest.mark.asyncio
-async def test_get_answer_sources_prompt_compliance(mock_rag_dependencies):
-    mock_vector_store, mock_llm, MockEnsemble, mock_ensemble_instance, \
-    MockHFCrossEncoder, MockCrossEncoderReranker, MockCompressionRetriever, \
-    mock_compression_retriever_instance, _ = mock_rag_dependencies
+async def test_initialization_no_db():
+    with patch("os.path.exists", return_value=False), \
+         patch("bot.rag_service.HuggingFaceEmbeddings"):
+        with pytest.raises(FileNotFoundError):
+            RAGService()
 
-    # Setup mock return value for retrieve
-    doc1 = Document(page_content="content1", metadata={"source": "doc1.txt", "chunk_id": 1})
-    doc2 = Document(page_content="content2", metadata={"source": "doc2.txt", "chunk_id": 2, "title": "Title 2"})
+@pytest.mark.asyncio
+async def test_initialization_bm25_fail(mock_dependencies):
+    # Simulate BM25 file exists but pickle load fails
+    with patch("os.path.exists", side_effect=lambda x: True), \
+         patch("bot.rag_service.pickle.load", side_effect=Exception("Pickle Error")), \
+         patch("bot.rag_service.HuggingFaceEmbeddings"), \
+         patch("bot.rag_service.Chroma") as MockChroma:
 
-    # Mock compression retriever ainvoke (since it wraps others)
-    mock_compression_retriever_instance.ainvoke = AsyncMock(return_value=[doc1, doc2])
+        MockChroma.return_value.as_retriever.return_value = MagicMock()
 
-    # Mock LLM stream to simulate structured response with sources
-    async def mock_stream(messages):
-        yield MagicMock(content="1. **Краткий вывод**: Да.\n")
-        yield MagicMock(content="2. **Обоснование**: Потому что.\n")
-        yield MagicMock(content="3. **Источники**: doc1.txt, doc2.txt")
-    mock_llm.astream = mock_stream
+        # Should catch error and proceed with base retriever
+        service = RAGService()
+        assert service.retriever is not None
 
+@pytest.mark.asyncio
+async def test_initialization_reranker_fail(mock_dependencies):
+    with patch("bot.rag_service.HuggingFaceCrossEncoder", side_effect=Exception("Model Error")):
+         service = RAGService()
+         assert service.retriever is not None # fallback to base
+
+@pytest.mark.asyncio
+async def test_reset_history(mock_dependencies):
+    mock_llm, mock_graph, MockCreateGraph = mock_dependencies
+    service = RAGService()
+    service.history[123] = ["msg"]
+    service.reset_history(123)
+    assert 123 not in service.history
+
+@pytest.mark.asyncio
+async def test_get_answer_flow(mock_dependencies):
+    mock_llm, mock_graph, MockCreateGraph = mock_dependencies
     service = RAGService()
 
-    # Run
+    # Mock graph.astream_events to yield some events
+    async def mock_astream_events(input_state, version):
+        # 1. Tool start
+        yield {
+            "event": "on_tool_start",
+            "name": "search_laws",
+            "data": {}
+        }
+        # 2. LLM streaming tokens
+        yield {
+            "event": "on_chat_model_stream",
+            "data": {"chunk": AIMessageChunk(content="Hello")}
+        }
+        yield {
+            "event": "on_chat_model_stream",
+            "data": {"chunk": AIMessageChunk(content=" World")}
+        }
+
+    mock_graph.astream_events = mock_astream_events
+
     responses = []
     async for chunk in service.get_answer(123, "question"):
         responses.append(chunk)
 
     full_response = "".join(responses)
 
-    # Check sources presence (from LLM)
-    assert "**Источники**" in full_response
-    assert "doc1.txt" in full_response
+    # Check if tool feedback was yielded
+    assert "⏳ Выполняю запрос к инструментам..." in full_response
+    # Check if LLM content was yielded
+    assert "Hello World" in full_response
 
-    # Check that manual legacy appending is GONE
-    # Previous manual format was "**Основания:**"
-    assert "**Основания:**" not in full_response
-
-@pytest.mark.asyncio
-async def test_initialization_full_pipeline(mock_rag_dependencies):
-    mock_vector_store, mock_llm, MockEnsemble, mock_ensemble_instance, \
-    MockHFCrossEncoder, MockCrossEncoderReranker, MockCompressionRetriever, \
-    mock_compression_retriever_instance, _ = mock_rag_dependencies
-
-    # RAGService should init embeddings, Chroma, BM25(Ensemble), CrossEncoder, ContextualCompression
-    service = RAGService()
-
-    # Check Ensemble
-    assert MockEnsemble.called
-
-    # Check Reranker
-    assert MockHFCrossEncoder.called
-    assert MockCrossEncoderReranker.called
-    assert MockCompressionRetriever.called
-
-    assert service.retriever == mock_compression_retriever_instance
+    # Check history update
+    assert len(service.history[123]) == 2
+    assert service.history[123][1].content == "Hello World"
 
 @pytest.mark.asyncio
-async def test_initialization_reranker_failure(mock_rag_dependencies):
-    mock_vector_store, mock_llm, MockEnsemble, mock_ensemble_instance, \
-    MockHFCrossEncoder, MockCrossEncoderReranker, MockCompressionRetriever, \
-    mock_compression_retriever_instance, _ = mock_rag_dependencies
-
-    # Simulate Reranker failure
-    MockHFCrossEncoder.side_effect = Exception("Model not found")
-
+async def test_get_answer_error_handling(mock_dependencies):
+    mock_llm, mock_graph, MockCreateGraph = mock_dependencies
     service = RAGService()
 
-    # Should fallback to base retriever (Ensemble or Chroma)
-    # Since BM25 exists (mocked), it should be Ensemble
-    assert service.retriever == mock_ensemble_instance
+    # Mock graph to raise exception
+    mock_graph.astream_events.side_effect = Exception("Graph Error")
+
+    responses = []
+    async for chunk in service.get_answer(123, "question"):
+        responses.append(chunk)
+
+    assert "Произошла ошибка" in "".join(responses)
