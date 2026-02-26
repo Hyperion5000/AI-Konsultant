@@ -36,6 +36,24 @@ def test_search_laws_success():
     assert "--- Документ 1 ---" in result
     assert "Content 1" in result
 
+def test_search_laws_with_metadata():
+    mock_retriever = MagicMock()
+    mock_retriever.invoke.return_value = [
+        Document(
+            page_content="Content 3",
+            metadata={
+                "source": "Law.txt",
+                "chapter": "Глава 1",
+                "article": "Статья 5"
+            }
+        )
+    ]
+    set_retriever(mock_retriever)
+
+    result = search_laws.invoke({"query": "metadata test"})
+    # Expected: "Источник: Law.txt, Глава 1, Статья 5 "
+    assert "Law.txt, Глава 1, Статья 5" in result
+
 def test_search_laws_empty():
     mock_retriever = MagicMock()
     mock_retriever.invoke.return_value = []

@@ -37,8 +37,21 @@ def search_laws(query: str) -> str:
         for i, doc in enumerate(docs):
             content = doc.page_content
             source = doc.metadata.get("source", "Unknown")
+
+            # Enhance source with Chapter/Article info
+            chapter = doc.metadata.get("chapter")
+            article = doc.metadata.get("article")
+
+            source_parts = [source]
+            if chapter:
+                source_parts.append(chapter)
+            if article:
+                source_parts.append(article)
+
+            full_source = ", ".join(source_parts)
+
             title = doc.metadata.get("title", "")
-            results.append(f"--- Документ {i+1} ---\nИсточник: {source} {title}\nТекст: {content}")
+            results.append(f"--- Документ {i+1} ---\nИсточник: {full_source} {title}\nТекст: {content}")
 
         return "\n\n".join(results)
     except Exception as e:
