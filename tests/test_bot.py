@@ -2,34 +2,40 @@ import pytest
 import asyncio
 from unittest.mock import MagicMock, AsyncMock, patch
 from bot.handlers.base import command_reset_handler, command_start_handler
-from bot.handlers.chat import process_question
-from aiogram.types import Message
-from bot.rag_service import RAGService
+from bot.handlers.chat import process_question, handle_message
+from aiogram.types import Message, User
+from langgraph.graph.state import CompiledStateGraph
 
 @pytest.fixture
 def mock_message():
-    message = AsyncMock()
-    message.from_user.id = 123
-    message.from_user.full_name = "Test User"
+    # Create Message mock
+    message = MagicMock(spec=Message)
+
+    # Mock User
+    user = MagicMock(spec=User)
+    user.id = 123
+    user.full_name = "Test User"
+    message.from_user = user
+
     message.text = "Question"
 
-    # Mock message.answer to return a NEW mock each time (simulating new message object)
-    # But we need to track them.
+    # Mock answer method as AsyncMock
+    # We want to capture the returned message mock to inspect edit_text calls
+    last_msg_mock = MagicMock(spec=Message)
+    last_msg_mock.edit_text = AsyncMock()
 
-    # Side effect to return a new AsyncMock
-    def answer_side_effect(*args, **kwargs):
-        msg = AsyncMock()
-        msg.edit_text = AsyncMock() # Ensure edit_text is mockable
-        return msg
+    async def answer_side_effect(*args, **kwargs):
+        return last_msg_mock
 
-    message.answer.side_effect = answer_side_effect
+    message.answer = AsyncMock(side_effect=answer_side_effect)
+    # Attach last_msg_mock to message for inspection in tests
+    message.last_msg_mock = last_msg_mock
     return message
 
 @pytest.fixture
-def mock_rag():
-    rag = MagicMock(spec=RAGService)
-    rag.reset_history = MagicMock()
-    return rag
+def mock_graph():
+    graph = MagicMock(spec=CompiledStateGraph)
+    return graph
 
 @pytest.fixture
 def llm_lock():
@@ -38,58 +44,90 @@ def llm_lock():
 @pytest.mark.asyncio
 async def test_command_start(mock_message):
     await command_start_handler(mock_message)
-    mock_message.answer.assert_called_once()
-    assert "Привет" in mock_message.answer.call_args[0][0]
-
-@pytest.mark.asyncio
-async def test_command_reset(mock_message, mock_rag):
-    # Pass mock_rag explicitly
-    await command_reset_handler(mock_message, rag_service=mock_rag)
-    mock_rag.reset_history.assert_called_with(123)
-    # Check if answer was called with success message
     assert mock_message.answer.called
-    assert "очищена" in mock_message.answer.call_args[0][0]
+    args = mock_message.answer.call_args[0]
+    assert "Привет" in args[0]
 
 @pytest.mark.asyncio
-async def test_process_question_long_message(mock_message, mock_rag, llm_lock):
-    # Test message splitting when response > 4000 chars
-
-    # 45 chunks * 100 = 4500 chars. Limit is 4000.
-    chunk = "a" * 100
-
-    async def mock_generator(uid, q):
-        for _ in range(45):
-             yield chunk
-
-    mock_rag.get_answer.side_effect = mock_generator
-
-    await process_question(mock_rag, mock_message, 123, "Long question", llm_lock)
-
-    # Verify that message.answer("...") was called
-    # Calls to message.answer:
-    # 1. "Analysing..." (initial)
-    # 2. "..." (when split happens)
-
-    answer_calls = mock_message.answer.call_args_list
-    assert len(answer_calls) >= 2
-    assert answer_calls[0][0][0] == "🔍 Анализирую законы..."
-
-    # Check if "..." was sent
-    continuation_calls = [call for call in answer_calls if call.args[0] == "..."]
-    assert len(continuation_calls) >= 1
+async def test_command_reset(mock_message):
+    # Mock clear_chat_history where it is imported in handlers/base.py
+    with patch("bot.handlers.base.clear_chat_history", new_callable=AsyncMock) as mock_clear:
+        await command_reset_handler(mock_message)
+        mock_clear.assert_called_once_with(123)
+        assert mock_message.answer.called
+        assert "очищена" in mock_message.answer.call_args[0][0]
 
 @pytest.mark.asyncio
-async def test_process_question_error(mock_message, mock_rag, llm_lock):
-    async def error_generator(uid, q):
-        raise Exception("Error")
-        yield "ignored" # Unreachable
+async def test_handle_message_no_graph(mock_message, llm_lock):
+    await handle_message(mock_message, None, llm_lock)
+    assert mock_message.answer.called
+    assert "инициализируется" in mock_message.answer.call_args[0][0]
 
-    mock_rag.get_answer.side_effect = error_generator
+@pytest.mark.asyncio
+async def test_handle_message_calls_process(mock_message, mock_graph, llm_lock):
+    with patch("bot.handlers.chat.process_question", new_callable=AsyncMock) as mock_process:
+        await handle_message(mock_message, mock_graph, llm_lock)
+        mock_process.assert_called_once()
 
-    await process_question(mock_rag, mock_message, 123, "Error", llm_lock)
+@pytest.mark.asyncio
+async def test_process_question(mock_message, mock_graph, llm_lock):
+    # Async generator for graph events
+    async def event_generator(*args, **kwargs):
+        # Yield tool start
+        yield {"event": "on_tool_start", "data": {}}
 
-    # We can't easily assert on the return value of message.answer() because it's dynamic mock.
-    # But we can check that an error message was sent or edited.
-    # Since we can't inspect the returned mock object easily here without capturing,
-    # let's just ensure no unhandled exception propagated.
-    pass
+        # Yield LLM chunk
+        chunk = MagicMock()
+        chunk.content = "Hello"
+        yield {"event": "on_chat_model_stream", "data": {"chunk": chunk}}
+
+        # Yield another chunk
+        chunk2 = MagicMock()
+        chunk2.content = " World"
+        yield {"event": "on_chat_model_stream", "data": {"chunk": chunk2}}
+
+    mock_graph.astream_events.side_effect = event_generator
+
+    # Mock get_chat_history and log_chat in handlers/chat.py
+    with patch("bot.handlers.chat.get_chat_history", new_callable=AsyncMock) as mock_history, \
+         patch("bot.handlers.chat.log_chat", new_callable=AsyncMock) as mock_log:
+
+        mock_history.return_value = [] # Empty history
+
+        await process_question(mock_graph, mock_message, 123, "Test Question", llm_lock)
+
+        # Verify interactions
+        mock_history.assert_called_once_with(123)
+        mock_graph.astream_events.assert_called()
+
+        # Verify edit_text called on status message
+        # last_msg_mock is the status message returned by message.answer
+        assert mock_message.last_msg_mock.edit_text.called
+        # Check final text
+        # calls:
+        # 1. "⏳ ..." (tool usage) - accumulated in display_text
+        # 2. "⏳ ...Hello" - accumulated
+        # 3. "⏳ ...Hello World" - accumulated
+        # But logic only calls edit_text periodically or at end.
+        # At end: "⏳ ...Hello World"
+
+        # We can inspect call args
+        args = mock_message.last_msg_mock.edit_text.call_args[0]
+        assert "Hello World" in args[0]
+        assert "⏳" in args[0]
+
+@pytest.mark.asyncio
+async def test_process_question_error(mock_message, mock_graph, llm_lock):
+    # Mock error during streaming
+    mock_graph.astream_events.side_effect = Exception("Graph Error")
+
+    with patch("bot.handlers.chat.get_chat_history", new_callable=AsyncMock), \
+         patch("bot.handlers.chat.log_chat", new_callable=AsyncMock):
+
+        # Should not raise exception
+        await process_question(mock_graph, mock_message, 123, "Error", llm_lock)
+
+        # Verify error message sent
+        assert mock_message.last_msg_mock.edit_text.called
+        args = mock_message.last_msg_mock.edit_text.call_args[0]
+        assert "ошибка" in args[0].lower()

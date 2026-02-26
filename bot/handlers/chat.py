@@ -1,48 +1,54 @@
 import asyncio
 import logging
 import time
+from typing import AsyncGenerator
+
 from aiogram import Router, F
 from aiogram.types import Message
-from bot.rag_service import RAGService
+from langgraph.graph.state import CompiledStateGraph
+from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
+
+from bot.core.prompts import (
+    MSG_BOT_INITIALIZING,
+    MSG_ANALYZING_LAWS,
+    MSG_CONTINUE,
+    MSG_NO_ANSWER,
+    MSG_GENERATION_ERROR,
+    MSG_GENERATION_ERROR_SHORT,
+    CURSOR_MARKER,
+    MSG_TOOL_USAGE,
+    AGENT_SYSTEM_PROMPT
+)
+from bot.database import get_chat_history, log_chat
+from bot.core.logger import get_logger
 
 router = Router()
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 @router.message(F.text)
-async def handle_message(message: Message, rag_service: RAGService, llm_lock: asyncio.Lock):
+async def handle_message(message: Message, graph: CompiledStateGraph, llm_lock: asyncio.Lock):
     """
     Handler for text messages.
     """
-    if not rag_service:
-        await message.answer("Бот инициализируется, пожалуйста, подождите...")
+    if not graph:
+        await message.answer(MSG_BOT_INITIALIZING)
         return
 
     user_id = message.from_user.id
     question = message.text
 
-    # We use the injected llm_lock to manage concurrency at the handler level if needed,
-    # or pass it to process_question.
-    # The requirement is to pass llm_lock to handlers.
-    # We will use it in process_question to ensure only one heavy generation happens at a time if that's the goal.
-    # Or maybe the user just wants it available.
-    # Given the CPU constraints, serializing is safer.
+    await process_question(graph, message, user_id, question, llm_lock)
 
-    # We don't want to block the handler itself (so we can answer ping/pong),
-    # but we want to process the question.
-    # We'll call process_question which will use the lock internally or we await it here?
-    # If we await it here, we block this coroutine.
-    await process_question(rag_service, message, user_id, question, llm_lock)
-
-async def process_question(rag_service: RAGService, message: Message, user_id: int, question: str, llm_lock: asyncio.Lock):
+async def process_question(graph: CompiledStateGraph, message: Message, user_id: int, question: str, llm_lock: asyncio.Lock):
     """
-    Process the question using RAG service with streaming response.
+    Process the question using LangGraph agent with streaming response.
     Handles long messages by splitting.
     """
     # Send initial status
-    status_msg = await message.answer("🔍 Анализирую законы...")
+    status_msg = await message.answer(MSG_ANALYZING_LAWS)
 
-    full_response = ""       # Total response
-    current_msg_text = ""    # Text for the currently active Telegram message
+    full_response = ""       # Total response (cleaned)
+    display_text = ""        # Text to display (including tool status)
     current_msg_obj = status_msg
 
     last_update_time = time.time()
@@ -51,50 +57,76 @@ async def process_question(rag_service: RAGService, message: Message, user_id: i
     TELEGRAM_LIMIT = 4000
 
     try:
-        # Acquire lock before starting generation to prevent CPU overload from multiple users
-        # interacting with the LLM simultaneously.
+        # Acquire lock before starting generation to prevent CPU overload
         async with llm_lock:
-            # Stream response from RAG service
-            async for chunk in rag_service.get_answer(user_id, question):
-                full_response += chunk
-                current_msg_text += chunk
-                buffer += chunk
+            # 1. Fetch History
+            history = await get_chat_history(user_id)
 
-                # Check if current message is getting too long
-                if len(current_msg_text) > TELEGRAM_LIMIT:
-                    try:
-                        await current_msg_obj.edit_text(current_msg_text)
-                    except Exception as e:
-                        logger.warning(f"Failed to finalize message part: {e}")
+            # 2. Construct Messages
+            messages = [SystemMessage(content=AGENT_SYSTEM_PROMPT)]
+            messages.extend(history)
+            messages.append(HumanMessage(content=question))
 
-                    current_msg_obj = await message.answer("...")
-                    current_msg_text = ""
-                    buffer = ""
-                    last_update_time = time.time()
-                    continue
+            input_state = {"messages": messages}
 
-                current_time = time.time()
-                # Smart buffering: update only if > 1.5s elapsed AND buffer > 30 chars
-                if (current_time - last_update_time > 1.5) and (len(buffer) > 30):
-                    try:
-                        await current_msg_obj.edit_text(current_msg_text + " ▌")
-                        last_update_time = current_time
+            # 3. Stream from Graph
+            async for event in graph.astream_events(input_state, version="v2"):
+                kind = event["event"]
+
+                chunk_text = ""
+                if kind == "on_tool_start":
+                    chunk_text = MSG_TOOL_USAGE
+                elif kind == "on_chat_model_stream":
+                    data = event["data"]
+                    if "chunk" in data:
+                        chunk_obj = data["chunk"]
+                        if hasattr(chunk_obj, "content") and chunk_obj.content:
+                            content = chunk_obj.content
+                            if isinstance(content, str) and content:
+                                chunk_text = content
+                                full_response += content
+
+                if chunk_text:
+                    display_text += chunk_text
+                    buffer += chunk_text
+
+                    # Check limits and update
+                    if len(display_text) > TELEGRAM_LIMIT:
+                        try:
+                            await current_msg_obj.edit_text(display_text)
+                        except Exception as e:
+                            logger.warning(f"Failed to finalize message part: {e}")
+
+                        current_msg_obj = await message.answer(MSG_CONTINUE)
+                        display_text = ""
                         buffer = ""
-                    except Exception as e:
-                        logger.warning(f"Failed to edit message: {e}")
+                        last_update_time = time.time()
+                        continue
+
+                    current_time = time.time()
+                    if (current_time - last_update_time > 1.5) and (len(buffer) > 30):
+                        try:
+                            await current_msg_obj.edit_text(display_text + CURSOR_MARKER)
+                            last_update_time = current_time
+                            buffer = ""
+                        except Exception as e:
+                            logger.warning(f"Failed to edit message: {e}")
 
         # Final update
-        if current_msg_text:
+        if display_text:
             try:
-                await current_msg_obj.edit_text(current_msg_text)
+                await current_msg_obj.edit_text(display_text)
             except Exception as e:
                 logger.warning(f"Failed to final edit message: {e}")
         elif not full_response:
-             await current_msg_obj.edit_text("Не удалось сформировать ответ.")
+             await current_msg_obj.edit_text(MSG_NO_ANSWER)
+
+        # Log Chat
+        asyncio.create_task(log_chat(user_id, question, full_response, "Agent Managed"))
 
     except Exception as e:
         logger.error(f"Error processing question: {e}")
         try:
-            await current_msg_obj.edit_text("Произошла ошибка при генерации ответа. Попробуйте позже.")
+            await current_msg_obj.edit_text(MSG_GENERATION_ERROR)
         except:
-            await message.answer("Произошла ошибка при генерации ответа.")
+            await message.answer(MSG_GENERATION_ERROR_SHORT)

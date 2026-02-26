@@ -1,5 +1,17 @@
 __pycache__/
 *.pyc
 .venv/
-db/
 .pytest_cache/
+.coverage
+
+# Databases and Storage
+test_db/
+db/
+storage/chroma/*
+!storage/chroma/.gitkeep
+storage/bm25/*
+!storage/bm25/.gitkeep
+storage/sqlite/*
+!storage/sqlite/.gitkeep
+storage/documents/*
+!storage/documents/.gitkeep

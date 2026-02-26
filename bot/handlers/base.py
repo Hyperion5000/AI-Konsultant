@@ -1,9 +1,12 @@
-from aiogram import Router, F
+import logging
+from aiogram import Router
 from aiogram.filters import Command, CommandStart
 from aiogram.types import Message
-from bot.rag_service import RAGService
+from bot.database import clear_chat_history
+from bot.core.logger import get_logger
 
 router = Router()
+logger = get_logger(__name__)
 
 @router.message(CommandStart())
 async def command_start_handler(message: Message):
@@ -32,12 +35,10 @@ async def command_help_handler(message: Message):
     )
 
 @router.message(Command("reset"))
-async def command_reset_handler(message: Message, rag_service: RAGService):
+async def command_reset_handler(message: Message):
     """
     Handler for `/reset` command.
     """
-    if rag_service:
-        rag_service.reset_history(message.from_user.id)
-        await message.answer("История диалога очищена. Можем начать сначала!")
-    else:
-        await message.answer("Сервис еще не готов.")
+    # Simply call the database function
+    await clear_chat_history(message.from_user.id)
+    await message.answer("История диалога очищена. Можем начать сначала!")
