@@ -7,7 +7,8 @@ from langchain_core.documents import Document
 # Add project root to path so we can import scripts
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from scripts.ingest_data import load_documents, get_text_splitter, create_vector_store, main
+from scripts.ingest_data import load_documents, create_vector_store, main
+from scripts.legal_parser import LegalDocumentParser
 
 def test_load_documents():
     """
@@ -69,13 +70,47 @@ def test_load_documents():
                     assert documents[2].metadata["source"] == "test.pdf"
                     assert documents[2].metadata["type"] == "pdf"
 
-def test_text_splitter_configuration():
+def test_legal_parser_logic():
     """
-    Test that the text splitter is configured with the correct separators.
+    Strict test for LegalDocumentParser context preservation.
     """
-    splitter = get_text_splitter(1000, 200)
-    expected_separators = ["\nСтатья ", "\nГлава ", "\n\n", "\n", " ", ""]
-    assert splitter._separators == expected_separators
+    # Small chunk size to force splitting
+    parser = LegalDocumentParser(chunk_size=50, chunk_overlap=0)
+
+    text = (
+        "Статья 1. First Article Title\n"
+        "Here is some text belonging to article 1. "
+        "It needs to be long enough to split into chunks. "
+        "So we add more words here to ensure it crosses chunk_size.\n"
+        "Статья 2. Second Article\n"
+        "Short text for article 2."
+    )
+
+    docs = parser.parse(text, "test_file.txt")
+
+    # Check that we have metadata["article"] == "Статья 1" for multiple chunks
+    art1_chunks = [d for d in docs if d.metadata.get("article") == "Статья 1"]
+    art2_chunks = [d for d in docs if d.metadata.get("article") == "Статья 2"]
+
+    # We expect at least 2 chunks for Art 1 (length ~140 chars / 50)
+    assert len(art1_chunks) >= 2, f"Expected >=2 chunks for Art 1, got {len(art1_chunks)}"
+    assert len(art2_chunks) >= 1
+
+    # Check content of first chunk
+    assert "Статья 1" in art1_chunks[0].page_content
+
+    # Verify that all chunks for Article 1 have the correct metadata
+    for doc in art1_chunks:
+        assert doc.metadata["article"] == "Статья 1"
+
+    # Verify that the text is preserved across chunks
+    combined_text_art1 = "".join([d.page_content for d in art1_chunks])
+    assert "First Article Title" in combined_text_art1
+    assert "chunk_size" in combined_text_art1
+
+    # Check Art 2
+    assert "Second Article" in art2_chunks[0].page_content
+    assert art2_chunks[0].metadata["article"] == "Статья 2"
 
 def test_create_vector_store_logic():
     """
@@ -89,11 +124,17 @@ def test_create_vector_store_logic():
          patch("scripts.ingest_data.Chroma") as mock_chroma, \
          patch("scripts.ingest_data.BM25Retriever") as mock_bm25, \
          patch("scripts.ingest_data.pickle.dump") as mock_pickle_dump, \
-         patch("builtins.open", mock_open()) as mock_file:
+         patch("builtins.open", mock_open()) as mock_file, \
+         patch("scripts.ingest_data.LegalDocumentParser") as mock_parser_cls:
 
         # Mock BM25 instance
         mock_bm25_instance = MagicMock()
         mock_bm25.from_documents.return_value = mock_bm25_instance
+
+        # Mock Parser
+        mock_parser = MagicMock()
+        mock_parser_cls.return_value = mock_parser
+        mock_parser.parse.return_value = [Document(page_content="Test Chunk", metadata={"source": "unknown"})]
 
         create_vector_store(
             documents=documents,
@@ -106,6 +147,10 @@ def test_create_vector_store_logic():
 
         # Verify embeddings init
         mock_embeddings.assert_called_once_with(model_name="model_name")
+
+        # Verify Parser usage
+        mock_parser_cls.assert_called_once_with(chunk_size=100, chunk_overlap=20)
+        mock_parser.parse.assert_called()
 
         # Verify Chroma creation
         mock_chroma.from_documents.assert_called_once()

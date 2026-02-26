@@ -6,7 +6,6 @@ import logging
 import pickle
 from typing import List, Optional
 from dotenv import load_dotenv
-from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
 from langchain_community.retrievers import BM25Retriever
@@ -15,6 +14,13 @@ import docx
 
 # Ensure we can import bot.config
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+
+try:
+    from scripts.legal_parser import LegalDocumentParser
+except ImportError:
+    # If running directly from scripts/ and root not in path correctly for package import
+    sys.path.append(os.path.dirname(__file__))
+    from legal_parser import LegalDocumentParser
 
 # Import configuration
 try:
@@ -102,21 +108,6 @@ def load_documents(data_dir: str) -> List[Document]:
     logger.info(f"Total documents loaded: {len(documents)}")
     return documents
 
-def get_text_splitter(chunk_size: int, chunk_overlap: int) -> RecursiveCharacterTextSplitter:
-    """
-    Returns a configured text splitter for legal documents.
-    """
-    # Smart chunking for legal texts
-    # separators order matters: try to split by article/chapter first, then paragraphs, then sentences
-    separators = ["\nСтатья ", "\nГлава ", "\n\n", "\n", " ", ""]
-
-    return RecursiveCharacterTextSplitter(
-        chunk_size=chunk_size,
-        chunk_overlap=chunk_overlap,
-        separators=separators,
-        is_separator_regex=False
-    )
-
 def create_vector_store(
     documents: List[Document],
     chroma_dir: str,
@@ -132,8 +123,27 @@ def create_vector_store(
         logger.warning("No documents to index.")
         return
 
-    text_splitter = get_text_splitter(chunk_size, chunk_overlap)
-    split_docs = text_splitter.split_documents(documents)
+    logger.info("Parsing documents with LegalDocumentParser...")
+    parser = LegalDocumentParser(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+
+    split_docs = []
+    for doc in documents:
+        # doc.page_content is the full text
+        # doc.metadata["source"] is the filename
+        filename = doc.metadata.get("source", "unknown")
+        # We might want to preserve other metadata (like 'type')
+        base_metadata = doc.metadata.copy()
+
+        parsed_chunks = parser.parse(doc.page_content, filename)
+
+        for chunk in parsed_chunks:
+            # Merge base metadata (like 'type') with parser metadata (chapter, article)
+            # Parser metadata overwrites base metadata if keys conflict (e.g. source)
+            # which is fine as source is passed to parser.
+            combined_metadata = base_metadata.copy()
+            combined_metadata.update(chunk.metadata)
+            chunk.metadata = combined_metadata
+            split_docs.append(chunk)
 
     # Add chunk_id and title (optional) to metadata
     for i, doc in enumerate(split_docs):
